@@ -1,0 +1,315 @@
+name: Build APK and Magisk module
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ "main" ]
+
+permissions:
+  contents: write
+  actions: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android SDK packages
+        run: |
+          yes | sdkmanager --licenses >/dev/null || true
+          sdkmanager "platforms;android-34" "build-tools;34.0.0" "platform-tools"
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v3
+        with:
+          gradle-version: "8.7"
+
+      - name: Generate Android project
+        run: |
+          set -euo pipefail
+          mkdir -p generated/app/src/main/java/com/example/soundpad
+          mkdir -p generated/app/src/main/res/values
+          cat > generated/settings.gradle.kts <<'EOF'
+          pluginManagement {
+              repositories { google(); mavenCentral(); gradlePluginPortal() }
+              plugins {
+                  id("com.android.application") version "8.5.2"
+                  id("org.jetbrains.kotlin.android") version "1.9.24"
+              }
+          }
+          dependencyResolutionManagement { repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS); repositories { google(); mavenCentral() } }
+          rootProject.name = "soundpad-android"
+          include(":app")
+          EOF
+          cat > generated/build.gradle.kts <<'EOF'
+          plugins {}
+          EOF
+          cat > generated/app/build.gradle.kts <<'EOF'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+          
+          android {
+              namespace = "com.example.soundpad"
+              compileSdk = 34
+              defaultConfig {
+                  applicationId = "com.example.soundpad"
+                  minSdk = 33
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0.0"
+              }
+              buildTypes {
+                  getByName("debug") { isDebuggable = true }
+                  getByName("release") { isMinifyEnabled = false }
+              }
+              buildFeatures { compose = true }
+              composeOptions { kotlinCompilerExtensionVersion = "1.5.14" }
+              packaging { resources { excludes += "/META-INF/{AL2.0,LGPL2.1}" } }
+          }
+          
+          dependencies {
+              implementation(platform("androidx.compose:compose-bom:2024.06.00"))
+              implementation("androidx.compose.ui:ui")
+              implementation("androidx.compose.ui:ui-tooling-preview")
+              implementation("androidx.compose.material3:material3")
+              implementation("androidx.activity:activity-compose:1.9.0")
+              implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1")
+              debugImplementation("androidx.compose.ui:ui-tooling")
+          }
+          EOF
+          cat > generated/app/src/main/AndroidManifest.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.RECORD_AUDIO" />
+              <uses-permission android:name="android.permission.READ_MEDIA_AUDIO" />
+              <uses-permission android:name="android.permission.READ_MEDIA_VIDEO" />
+              <application android:allowBackup="true" android:label="SoundPad" android:supportsRtl="true" android:theme="@style/Theme.SoundPad">
+                  <activity android:name=".MainActivity" android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          EOF
+          cat > generated/app/src/main/res/values/styles.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <style name="Theme.SoundPad" parent="android:style/Theme.Material.NoActionBar">
+                  <item name="android:windowNoTitle">true</item>
+                  <item name="android:windowActionBar">false</item>
+                  <item name="android:windowLightStatusBar">true</item>
+              </style>
+          </resources>
+          EOF
+          cat > generated/app/src/main/java/com/example/soundpad/MainActivity.kt <<'EOF'
+          package com.example.soundpad
+          
+          import android.os.Bundle
+          import androidx.activity.ComponentActivity
+          import androidx.activity.compose.rememberLauncherForActivityResult
+          import androidx.activity.compose.setContent
+          import androidx.activity.result.contract.ActivityResultContracts
+          import androidx.compose.animation.AnimatedVisibility
+          import androidx.compose.foundation.ExperimentalFoundationApi
+          import androidx.compose.foundation.combinedClickable
+          import androidx.compose.foundation.layout.*
+          import androidx.compose.foundation.lazy.LazyColumn
+          import androidx.compose.foundation.lazy.itemsIndexed
+          import androidx.compose.foundation.shape.RoundedCornerShape
+          import androidx.compose.material3.*
+          import androidx.compose.runtime.*
+          import androidx.compose.ui.Alignment
+          import androidx.compose.ui.Modifier
+          import androidx.compose.ui.text.style.TextAlign
+          import androidx.compose.ui.unit.dp
+          import kotlinx.coroutines.Dispatchers
+          import kotlinx.coroutines.withContext
+          import java.io.File
+          
+          class MainActivity : ComponentActivity() {
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  setContent { SoundPadApp() }
+              }
+          }
+          
+          private val blue = lightColorScheme(primary = androidx.compose.ui.graphics.Color(0xFF0088CC))
+          
+          @Composable
+          fun SoundPadApp() {
+              MaterialTheme(colorScheme = blue) {
+                  var checked by remember { mutableStateOf(false) }
+                  var rooted by remember { mutableStateOf(false) }
+                  var rootError by remember { mutableStateOf<String?>(null) }
+                  var continueApp by remember { mutableStateOf(false) }
+                  val sounds = remember { mutableStateListOf<String>() }
+          
+                  LaunchedEffect(Unit) {
+                      val result = checkRoot()
+                      rooted = result.first
+                      rootError = result.second
+                      checked = true
+                  }
+          
+                  if (!continueApp) {
+                      RootScreen(
+                          checked = checked,
+                          rooted = rooted,
+                          error = rootError,
+                          onRetry = {
+                              checked = false
+                              rootError = null
+                              continueApp = false
+                          },
+                          onContinue = { continueApp = true }
+                      )
+                  } else {
+                      MainScaffold(rooted = rooted, sounds = sounds)
+                  }
+              }
+          }
+          
+          suspend fun checkRoot(): Pair<Boolean, String?> = withContext(Dispatchers.IO) {
+              try {
+                  val p = Runtime.getRuntime().exec(arrayOf("su", "-c", "echo rooted"))
+                  val out = p.inputStream.bufferedReader().readText().trim()
+                  Pair(out.contains("rooted"), if (out.contains("rooted")) null else "root-запрос отклонён или su недоступен")
+              } catch (t: Throwable) {
+                  Pair(false, t.message ?: "su недоступен")
+              }
+          }
+          
+          @Composable
+          fun RootScreen(checked: Boolean, rooted: Boolean, error: String?, onRetry: () -> Unit, onContinue: () -> Unit) {
+              Column(Modifier.fillMaxSize().padding(24.dp), verticalArrangement = Arrangement.Center, horizontalAlignment = Alignment.CenterHorizontally) {
+                  when {
+                      !checked -> { Text("Проверяем root-доступ…", style = MaterialTheme.typography.titleLarge); Spacer(Modifier.height(16.dp)); CircularProgressIndicator() }
+                      rooted -> { Text("Рут получен!", style = MaterialTheme.typography.headlineMedium); Spacer(Modifier.height(16.dp)); Button(onClick = onContinue) { Text("Продолжить") } }
+                      else -> { Text("Выдай root доступ ебантяй", style = MaterialTheme.typography.headlineSmall, textAlign = TextAlign.Center); Spacer(Modifier.height(8.dp)); Text("Статус: root не получен. ${error ?: ""}", textAlign = TextAlign.Center); Spacer(Modifier.height(16.dp)); Button(onClick = onRetry) { Text("Повторить запрос root") }; Spacer(Modifier.height(8.dp)); OutlinedButton(onClick = onContinue) { Text("Продолжить без root") } }
+                  }
+              }
+          }
+          
+          @Composable
+          fun MainScaffold(rooted: Boolean, sounds: MutableList<String>) {
+              var tab by remember { mutableIntStateOf(0) }
+              val labels = listOf("Библиотека", "Импорт", "Настройки", "Диагностика")
+              Scaffold(bottomBar = { NavigationBar { labels.forEachIndexed { i, label -> NavigationBarItem(selected = tab == i, onClick = { tab = i }, icon = {}, label = { Text(label) }) } } }) { pad ->
+                  Box(Modifier.fillMaxSize().padding(pad)) {
+                      when (tab) {
+                          0 -> LibraryScreen(rooted, sounds)
+                          1 -> ImportScreen(sounds)
+                          2 -> SettingsScreen()
+                          else -> DiagnosticScreen(rooted)
+                      }
+                  }
+              }
+          }
+          
+          @OptIn(ExperimentalFoundationApi::class)
+          @Composable
+          fun LibraryScreen(rooted: Boolean, sounds: List<String>) {
+              var active by remember { mutableStateOf<Int?>(null) }
+              Column(Modifier.fillMaxSize().padding(16.dp)) {
+                  Text("Библиотека", style = MaterialTheme.typography.headlineSmall)
+                  Text(if (rooted) "Root-режим доступен. Микрофонный вывод зависит от модуля." else "Fallback: локальное воспроизведение/диагностика.")
+                  Spacer(Modifier.height(12.dp))
+                  if (sounds.isEmpty()) Text("Импортируй звук во вкладке Импорт.")
+                  LazyColumn(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                      itemsIndexed(sounds) { index, item ->
+                          Card(Modifier.fillMaxWidth().combinedClickable(onClick = { active = if (active == index) null else index }, onLongClick = { active = index }), shape = RoundedCornerShape(20.dp)) {
+                              Row(Modifier.padding(16.dp), verticalAlignment = Alignment.CenterVertically) {
+                                  Text(listOf("😂", "😎", "🤯", "😈", "👻", "🤖")[index % 6], style = MaterialTheme.typography.headlineMedium)
+                                  Spacer(Modifier.width(12.dp))
+                                  Column(Modifier.weight(1f)) { Text(item, style = MaterialTheme.typography.titleMedium); Text("готово • нажми для запуска/стопа") }
+                                  AnimatedVisibility(active == index) { Text("▶") }
+                              }
+                          }
+                      }
+                  }
+              }
+          }
+          
+          @Composable
+          fun ImportScreen(sounds: MutableList<String>) {
+              val picker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri -> uri?.let { sounds.add((it.lastPathSegment ?: "sound").substringAfterLast('/')) } }
+              Column(Modifier.fillMaxSize().padding(16.dp), verticalArrangement = Arrangement.Center, horizontalAlignment = Alignment.CenterHorizontally) {
+                  Text("Импорт аудио/видео", style = MaterialTheme.typography.headlineSmall)
+                  Spacer(Modifier.height(10.dp))
+                  Text("Файл выбирается через системный picker. Облачной обработки нет.", textAlign = TextAlign.Center)
+                  Spacer(Modifier.height(16.dp))
+                  Button(onClick = { picker.launch(arrayOf("audio/*", "video/*")) }) { Text("Выбрать файл") }
+              }
+          }
+          
+          @Composable fun SettingsScreen() { Column(Modifier.fillMaxSize().padding(16.dp)) { Text("Настройки", style = MaterialTheme.typography.headlineSmall); Text("• слышать звук самому: выкл/вкл"); Text("• усиление микрофона"); Text("• тест root"); Text("• тест аудиомаршрутизации"); Text("• тема: системная/светлая/тёмная") } }
+          @Composable fun DiagnosticScreen(rooted: Boolean) { Column(Modifier.fillMaxSize().padding(16.dp)) { Text("Диагностика", style = MaterialTheme.typography.headlineSmall); Text("root-доступ: ${if (rooted) "есть" else "нет"}"); Text("Magisk-модуль установлен: ${File("/data/adb/modules/soundpad-module").exists()}"); Text("виртуальный микрофон: зависит от прошивки/драйвера"); Text("последняя ошибка: см. /data/adb/modules/soundpad-module/soundpad.log") } }
+          EOF
+
+      - name: Generate Magisk module
+        run: |
+          mkdir -p magisk-module
+          cat > magisk-module/module.prop <<'EOF'
+          id=soundpad-module
+          name=SoundPad Virtual Microphone
+          version=1.0.0
+          versionCode=1
+          author=1325ilya
+          description=Safe transparent SoundPad helper module. No recording, no spying, no network upload.
+          EOF
+          cat > magisk-module/service.sh <<'EOF'
+          #!/system/bin/sh
+          MODDIR=${0%/*}
+          LOGFILE="$MODDIR/soundpad.log"
+          log(){ echo "$(date '+%Y-%m-%d %H:%M:%S') $1" >> "$LOGFILE"; }
+          log "SoundPad module start"
+          API=$(getprop ro.build.version.sdk)
+          ABI=$(getprop ro.product.cpu.abi)
+          if [ "$API" -lt 33 ]; then log "Unsupported Android API $API"; exit 0; fi
+          case "$ABI" in arm64-v8a*) log "ABI OK: $ABI" ;; *) log "Unsupported ABI: $ABI"; exit 0 ;; esac
+          log "Module active. Audio bridge is firmware-dependent stub."
+          exit 0
+          EOF
+          cat > magisk-module/system.prop <<'EOF'
+          # SoundPad module: intentionally empty. Systemless and safe by default.
+          EOF
+          chmod +x magisk-module/service.sh
+
+      - name: Build APK
+        run: gradle -p generated :app:assembleDebug --no-daemon --stacktrace
+
+      - name: Package artifacts
+        run: |
+          mkdir -p artifacts
+          cp generated/app/build/outputs/apk/debug/app-debug.apk artifacts/SoundPad-android-debug.apk
+          (cd magisk-module && zip -r9 ../artifacts/SoundPad-magisk-module.zip .)
+          zip -r9 artifacts/SoundPad-source.zip generated magisk-module README.md .github/workflows/build-release.yml
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: soundpad-apk-module-source
+          path: artifacts/*
+
+      - name: Publish GitHub release
+        if: github.ref == 'refs/heads/main'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="v1.0.${{ github.run_number }}"
+          gh release create "$TAG" artifacts/SoundPad-android-debug.apk artifacts/SoundPad-magisk-module.zip artifacts/SoundPad-source.zip --title "SoundPad $TAG" --notes "Автосборка APK и Magisk-модуля. APK debug-signed; Magisk-модуль безопасный systemless stub." --latest
